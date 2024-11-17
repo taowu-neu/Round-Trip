@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OSRM Walking Route with Elevation</title>
+    <style>
+        #map {
+            height: 500px;
+            width: 100%;
+        }
+        #distanceInput {
+            margin: 10px;
+        }
+        #output {
+            margin-top: 10px;
+        }
+        #elevationChart {
+            width: 100%;
+            height: 300px;
+        }
+    </style>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://unpkg.com/@turf/turf@6"></script> <!-- 引入turf.js用于地理计算 -->
+</head>
+<body>
+
+<h3>Generate Walking Route with OSRM Trip API and Elevation Data</h3>
+<input type="number" id="distanceInput" placeholder="Enter distance in km" />
+<button onclick="generateMultipleRoutes()">Generate 30 Routes</button>
+<div id="map"></div>
+<div id="output"></div>
+<canvas id="elevationChart"></canvas> <!-- 用于绘制海拔变化的图表 -->
+
+<script>
+    let map, userLocation;
+    let currentRoute; // 用于存储最后生成的路径
+    const tolerance = 0.5 * 1000; // 容忍误差设置为500米
+    const batchSize = 5; // 每次并行生成5条路径
+    let chartInstance; // 保存当前图表实例
+    let poiMarkers = []; // 保存POI的标记
+    let poiList = []; // 保存POI的位置信息
+
+    // 初始化地图
+    map = L.map('map').setView([51.505, -0.09], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    // 获取用户的当前位置
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+            (position) => {
+                userLocation = {
+                    lat: position.coords.latitude,
+                    lng: position.coords.longitude,
+                };
+
+                map.setView(userLocation, 14);
+
+                // 在用户位置添加标记
+                L.marker(userLocation).addTo(map);
+            },
+            () => {
+                alert("Geolocation failed.");
+            }
+        );
+    } else {
+        alert("Your browser doesn't support geolocation.");
+    }
+
+    // 生成精确距离的随机点
+    function generatePrecisePoints(origin, totalDistance) {
+        const points = [];
+        const numberOfPoints = Math.max(3, Math.floor(totalDistance / 2000)); // 动态调整点的数量
+        const segmentDistance = totalDistance / numberOfPoints; // 每段的距离
+
+        for (let i = 0; i < numberOfPoints; i++) {
+            points.push(calculateDestination(origin, segmentDistance));
+        }
+        return points;
+    }
+
+    // 计算目标点
+    function calculateDestination(origin, distance) {
+        const earthRadius = 6371e3; // 地球半径，单位为米
+        const angularDistance = distance / earthRadius; // 角距离
+
+        // 随机选择一个方向 (方位角)
+        const bearing = Math.random() * 2 * Math.PI;
+
+        // 使用球面三角法计算新的纬度和经度
+        const lat1 = origin.lat * Math.PI / 180;
+        const lng1 = origin.lng * Math.PI / 180;
+
+        const lat2 = Math.asin(Math.sin(lat1) * Math.cos(angularDistance) +
+                    Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing));
+
+        const lng2 = lng1 + Math.atan2(Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+                                       Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2));
+
+        return {
+            lat: lat2 * 180 / Math.PI,
+            lng: lng2 * 180 / Math.PI
+        };
+    }
+
+    // 使用OSRM Trip API生成路径
+    async function generateRoute(routeIndex) {
+        const inputDistance = parseFloat(document.getElementById('distanceInput').value) * 1000; // 将公里转换为米
+        if (!inputDistance || inputDistance <= 0) {
+            alert('Please enter a valid distance.');
+            return;
+        }
+
+        // 仅在第一次时获取POIs，使用距离的一半作为查询半径
+        if (poiList.length === 0) {
+            await fetchPOIs(inputDistance / 2);
+        }
+
+        // 生成精确距离的随机点
+        const waypoints = generatePrecisePoints(userLocation, inputDistance);
+
+        // 构建trip API的请求
+        const coords = waypoints.map(p => `${p.lng},${p.lat}`).join(';');
+        const query = `http://localhost:5050/trip/v1/foot/${userLocation.lng},${userLocation.lat};${coords}?roundtrip=true&source=first&destination=last&geometries=geojson`;
+
+        try {
+            const response = await fetch(query);
+            const data = await response.json();
+
+            if (data.trips && data.trips.length > 0) {
+                const trip = data.trips[0];
+                const coordinates = trip.geometry.coordinates.map(coord => [coord[1], coord[0]]);
+                
+                // 计算实际距离
+                const actualDistance = trip.distance;
+
+                // 如果距离误差超过容忍值，则调整路径
+                if (Math.abs(actualDistance - inputDistance) > tolerance) {
+                    adjustRoute(inputDistance, actualDistance);
+                    return;
+                }
+
+                // 清除之前的路线和POI标记
+                if (currentRoute) {
+                    map.removeLayer(currentRoute);
+                }
+                clearPOIMarkers();
+
+                // 在地图上绘制最后一条路径
+                currentRoute = L.polyline(coordinates, { color: 'blue' }).addTo(map);
+                map.fitBounds(currentRoute.getBounds());
+
+                // 获取海拔数据
+                const elevationData = await getElevationData(coordinates);
+                const { totalAscent, totalDescent } = calculateElevationStats(elevationData);
+
+                // 计算路径经过的 POI 数量
+                const poiCount = countPOIsOnRoute(coordinates);
+                
+                const elevationChange = totalAscent + totalDescent;
+                console.log(`Route ${routeIndex + 1}: Distance = ${(actualDistance / 1000).toFixed(2)} km, Elevation Change = ${elevationChange} m, POIs = ${poiCount}`);
+                document.getElementById('output').innerHTML += `Route ${routeIndex + 1}: Distance = ${(actualDistance / 1000).toFixed(2)} km, Elevation Change = ${elevationChange} m, POIs = ${poiCount}<br>`;
+
+                // 绘制海拔变化图表
+                drawElevationChart(elevationData);
+            } else {
+                alert('No route found.');
+            }
+        } catch (error) {
+            console.error('Error generating route:', error);
+        }
+    }
+
+    // 自动获取POIs并存储在poiList中
+    async function fetchPOIs(radius) {
+        const query = `[out:json];(node["tourism"="attraction"](around:${radius},${userLocation.lat},${userLocation.lng});
+        way["tourism"="attraction"](around:${radius},${userLocation.lat},${userLocation.lng});
+        relation["tourism"="attraction"](around:${radius},${userLocation.lat},${userLocation.lng});
+        node["historic"="monument"](around:${radius},${userLocation.lat},${userLocation.lng});
+        way["historic"="monument"](around:${radius},${userLocation.lat},${userLocation.lng});
+        relation["historic"="monument"](around:${radius},${userLocation.lat},${userLocation.lng});
+        node["leisure"="park"](around:${radius},${userLocation.lat},${userLocation.lng});
+        way["leisure"="park"](around:${radius},${userLocation.lat},${userLocation.lng});
+        relation["leisure"="park"](around:${radius},${userLocation.lat},${userLocation.lng});
+        node["landuse"="recreation_ground"](around:${radius},${userLocation.lat},${userLocation.lng});
+        way["landuse"="recreation_ground"](around:${radius},${userLocation.lat},${userLocation.lng});
+        relation["landuse"="recreation_ground"](around:${radius},${userLocation.lat},${userLocation.lng}););out center;`;
+
+        const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+
+        try {
+            const response = await fetch(url);
+            const data = await response.json();
+
+            poiList = [];
+            data.elements.forEach(element => {
+                const lat = element.lat || element.center.lat;
+                const lng = element.lon || element.center.lon;
+                const name = element.tags.name || 'Unnamed POI';
+                poiList.push({ lat, lng, name });
+            });
+        } catch (error) {
+            console.error('Error fetching POIs:', error);
+        }
+    }
+
+    // 清除所有 POI 标记
+    function clearPOIMarkers() {
+        poiMarkers.forEach(marker => map.removeLayer(marker));
+        poiMarkers = [];
+    }
+
+    // 计算路径上经过的 POI 数量并在地图上标注经过的POI
+    function countPOIsOnRoute(coordinates) {
+        const bufferRadius = 0.1; // 缓冲区半径设置为100米
+        const visitedPOIs = new Set();
+
+        coordinates.forEach(([lat, lng]) => {
+            const point = turf.point([lng, lat]);
+
+            poiList.forEach((poi, index) => {
+                const poiPoint = turf.point([poi.lng, poi.lat]);
+                const buffered = turf.buffer(poiPoint, bufferRadius, { units: 'kilometers' });
+
+                if (turf.booleanPointInPolygon(point, buffered)) {
+                    visitedPOIs.add(index);
+
+                    // 在地图上标记经过的 POI
+                    const marker = L.marker([poi.lat, poi.lng]).addTo(map)
+                        .bindPopup(poi.name);
+                    poiMarkers.push(marker);
+                }
+            });
+        });
+
+        console.log(`Total visited POIs for this route: ${visitedPOIs.size}`);
+        return visitedPOIs.size;
+    }
+
+    // 使用代理服务器获取海拔数据
+    async function getElevationData(coordinates) {
+        const path = coordinates.map(coord => `${coord[0]},${coord[1]}`).join('|');
+        const elevationUrl = `http://localhost:3000/elevation?path=${path}&samples=200&key=AIzaSyDBpCjhtC6Ne9GqU84l4qLcMs4O_gzDwyM`;
+
+        try {
+            const response = await fetch(elevationUrl);
+            const data = await response.json();
+            if (data.results && data.results.length > 0) {
+                return data.results.map(result => result.elevation);
+            } else {
+                console.error('Error fetching elevation data:', data);
+                return [];
+            }
+        } catch (error) {
+            console.error('Error fetching elevation data:', error);
+            return [];
+        }
+    }
+
+    // 计算海拔上升和下降
+    function calculateElevationStats(elevations) {
+        let totalAscent = 0;
+        let totalDescent = 0;
+
+        for (let i = 1; i < elevations.length; i++) {
+            const diff = elevations[i] - elevations[i - 1];
+            if (diff > 0) {
+                totalAscent += diff;
+            } else {
+                totalDescent += Math.abs(diff);
+            }
+        }
+
+        return {
+            totalAscent: Math.round(totalAscent),
+            totalDescent: Math.round(totalDescent),
+        };
+    }
+
+    // 绘制海拔变化图表
+    function drawElevationChart(elevations) {
+        const ctx = document.getElementById('elevationChart').getContext('2d');
+
+        // 如果已经有图表实例，先销毁它
+        if (chartInstance) {
+            chartInstance.destroy();
+        }
+
+        // 创建新的图表
+        chartInstance = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: elevations.map((_, index) => index),
+                datasets: [{
+                    label: 'Elevation (m)',
+                    data: elevations,
+                    fill: false,
+                    borderColor: 'blue',
+                    tension: 0.1
+                }]
+            },
+            options: {
+                scales: {
+                    x: {
+                        title: {
+                            display: true,
+                            text: 'Sample Points'
+                        }
+                    },
+                    y: {
+                        title: {
+                            display: true,
+                            text: 'Elevation (m)'
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // 分批并行生成30条路径
+    async function generateMultipleRoutes() {
+        document.getElementById('output').innerHTML = ''; // 清除之前的输出
+
+        const inputDistance = parseFloat(document.getElementById('distanceInput').value) * 1000; // 将公里转换为米
+        if (!inputDistance || inputDistance <= 0) {
+            alert('Please enter a valid distance.');
+            return;
+        }
+
+        for (let i = 0; i < 30; i += batchSize) {
+            const promises = [];
+            for (let j = 0; j < batchSize && i + j < 30; j++) {
+                promises.push(generateRoute(i + j));
+            }
+
+            // 等待当前批次的所有路径生成完成
+            await Promise.all(promises);
+            console.log(`Batch ${Math.floor(i / batchSize) + 1} completed.`);
+        }
+        console.log('All routes generated. Only the last route is shown.');
+    }
+
+    // 调整路径以逼近用户输入的距离
+    function adjustRoute(inputDistance, actualDistance) {
+        let newDistance = inputDistance - (actualDistance - inputDistance) * 0.5; // 逐步调整
+        if (newDistance < 0) newDistance = inputDistance / 2;
+
+        // 递归调用以重新生成路径
+        generateRoute(newDistance);
+    }
+</script>
+
+</body>
+</html>
+
