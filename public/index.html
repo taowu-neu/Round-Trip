@@ -28,17 +28,37 @@
 <body>
 
 <h3>Generate Walking Route with OSRM Trip API and Elevation Data</h3>
-<input type="number" id="distanceInput" placeholder="Enter distance in km" />
-<label for="elevationSelect">Elevation Change:</label>
-<select id="elevationSelect">
-    <option value="">Select...</option>
-    <option value="0-200">0-200</option>
-    <option value="200-400">200-400</option>
-    <option value="400-600">400-600</option>
-    <option value="600-800">600-800</option>
-    <option value="800-1000">800-1000</option>
-    <option value="1000+">1000+</option>
-</select>
+<div>
+    <label for="distanceInput">Distance (km):</label>
+    <input type="number" id="distanceInput" placeholder="Enter distance in km" />
+</div>
+
+<div>
+    <label for="elevationSelect">Elevation Change:</label>
+    <select id="elevationSelect">
+        <option value="">Select...</option>
+        <option value="0-200">0-200</option>
+        <option value="200-400">200-400</option>
+        <option value="400-600">400-600</option>
+        <option value="600-800">600-800</option>
+        <option value="800-1000">800-1000</option>
+        <option value="1000+">1000+</option>
+    </select>
+</div>
+
+<div>
+    <label for="minPOI">Minimum POI:</label>
+    <input type="number" id="minPOI" placeholder="Enter minimum POI count" />
+</div>
+
+<div>
+    <label>Priority Factor:</label>
+    <input type="radio" id="priorityElevation" name="priorityFactor" value="elevation" checked />
+    <label for="priorityElevation">Elevation Change</label>
+    <input type="radio" id="priorityPOI" name="priorityFactor" value="poi" />
+    <label for="priorityPOI">POI Count</label>
+</div>
+
 <button onclick="generateAndFilterRoutes()">Generate and Filter Route</button>
 <div id="map"></div>
 <div id="output"></div>
@@ -46,22 +66,18 @@
 
 <script>
     let map, userLocation;
-    let currentRoute; // 用于存储最后显示的路径
-    const tolerance = 0.5 * 1000; // 容忍误差设置为500米
-    const batchSize = 5; // 每次并行生成5条路径
-    let chartInstance; // 保存当前图表实例
-    let poiMarkers = []; // 保存POI的标记
-    let poiList = []; // 保存POI的位置信息
-    let routesData = []; // 存储生成的30条路径数据
+    let currentRoute;
+    let chartInstance;
+    let poiMarkers = [];
+    let poiList = [];
+    let routesData = [];
 
-    // 初始化地图
     map = L.map('map').setView([51.505, -0.09], 13);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
         attribution: '© OpenStreetMap'
     }).addTo(map);
 
-    // 获取用户的当前位置
     if (navigator.geolocation) {
         navigator.geolocation.getCurrentPosition(
             (position) => {
@@ -69,10 +85,7 @@
                     lat: position.coords.latitude,
                     lng: position.coords.longitude,
                 };
-
                 map.setView(userLocation, 14);
-
-                // 在用户位置添加标记
                 L.marker(userLocation).addTo(map);
             },
             () => {
@@ -83,55 +96,48 @@
         alert("Your browser doesn't support geolocation.");
     }
 
-    // 主方法：生成并筛选路径
     async function generateAndFilterRoutes() {
-        document.getElementById('output').innerHTML = ''; // 清空输出区域
-        routesData = []; // 清空路径数据
+        document.getElementById('output').innerHTML = '';
+        routesData = [];
 
-        const inputDistance = parseFloat(document.getElementById('distanceInput').value) * 1000; // 用户输入的距离（米）
-        const selectedRange = document.getElementById('elevationSelect').value; // 用户选择的Elevation Change
+        const inputDistance = parseFloat(document.getElementById('distanceInput').value) * 1000;
+        const selectedRange = document.getElementById('elevationSelect').value;
+        const minPOI = parseInt(document.getElementById('minPOI').value, 10) || 0;
+        const priorityFactor = document.querySelector('input[name="priorityFactor"]:checked').value;
 
         if (!inputDistance || inputDistance <= 0) {
             alert('Please enter a valid distance.');
             return;
         }
 
-        if (!selectedRange) {
-            alert('Please select an elevation change range.');
-            return;
-        }
+        const tolerance = inputDistance * 0.15;
+        const batchSize = 10;
 
-        // 分批生成路径
-        for (let i = 0; i < 30; i += batchSize) {
+        console.log("Starting to generate 30 valid routes...");
+
+        while (routesData.length < 30) {
             const promises = [];
-            for (let j = 0; j < batchSize && i + j < 30; j++) {
-                promises.push(generateRoute(i + j, inputDistance));
+            for (let i = 0; i < batchSize && routesData.length + i < 30; i++) {
+                promises.push(generateRoute(routesData.length + i + 1, inputDistance, tolerance));
             }
             await Promise.all(promises);
+            console.log(`Current total valid routes: ${routesData.length}`);
         }
 
-        console.log("Generated Routes:");
-        routesData.forEach((route, index) => {
-            console.log(
-                `Route ${index + 1}: Distance = ${(route.distance / 1000).toFixed(2)} km, Elevation Change = ${route.elevationChange} m, POIs = ${route.poiCount}`
-            );
-        });
-
-        // 筛选符合条件的路径
-        filterRoutesByElevationChange(selectedRange);
+        console.log("All 30 valid routes generated.");
+        applyUserPreferences(priorityFactor, selectedRange, minPOI);
     }
 
-    async function generateRoute(routeIndex, inputDistance) {
-        if (poiList.length === 0) {
-            await fetchPOIs(inputDistance / 2);
-        }
-
-        const waypoints = generatePrecisePoints(userLocation, inputDistance);
-
-        const coords = waypoints.map(p => `${p.lng},${p.lat}`).join(';');
-        const query = `http://localhost:5050/trip/v1/foot/${userLocation.lng},${userLocation.lat};${coords}?roundtrip=true&source=first&destination=last&geometries=geojson`;
-
+    async function generateRoute(routeIndex, inputDistance, tolerance) {
         try {
+            if (poiList.length === 0) {
+                await fetchPOIs(inputDistance / 2);
+            }
+
+            const waypoints = generatePrecisePoints(userLocation, inputDistance);
+            const coords = waypoints.map(p => `${p.lng},${p.lat}`).join(';');
+            const query = `http://localhost:5050/trip/v1/foot/${userLocation.lng},${userLocation.lat};${coords}?roundtrip=true&source=first&destination=last&geometries=geojson`;
+
             const response = await fetch(query);
             const data = await response.json();
 
@@ -141,6 +147,7 @@
                 const actualDistance = trip.distance;
 
                 if (Math.abs(actualDistance - inputDistance) > tolerance) {
+                    console.log(`Route ${routeIndex} skipped due to distance tolerance.`);
                     return;
                 }
 
@@ -152,51 +159,70 @@
                     routeIndex,
                     coordinates,
                     distance: actualDistance,
-                    elevationChange: totalAscent + totalAscent,
+                    elevationChange: totalAscent,
                     poiCount,
                 });
+
+                console.log(`Route ${routeIndex} generated successfully.`);
+            } else {
+                console.log(`Route ${routeIndex} not found.`);
             }
         } catch (error) {
-            console.error('Error generating route:', error);
+            console.error(`Error generating route ${routeIndex}:`, error);
         }
     }
 
-    function filterRoutesByElevationChange(selectedRange) {
-    const [min, max] = selectedRange === '1000+'
-        ? [1000, Infinity]
-        : selectedRange.split('-').map(Number);
+    function applyUserPreferences(priorityFactor, selectedRange, minPOI) {
+        const [minElevation, maxElevation] = selectedRange === '1000+'
+            ? [1000, Infinity]
+            : selectedRange.split('-').map(Number);
 
-    const filteredRoutes = routesData.filter(route =>
-        route.elevationChange >= min && route.elevationChange < max
-    );
+        let priorityFilteredRoutes;
+        let secondaryRank;
 
-    if (filteredRoutes.length === 0) {
-        const elevationValues = routesData.map(route => route.elevationChange);
-        const minElevation = Math.min(...elevationValues);
-        const maxElevation = Math.max(...elevationValues);
-        alert(`No routes found. Minimum elevation change: ${minElevation} m, Maximum elevation change: ${maxElevation} m`);
-        return;
+        if (priorityFactor === 'elevation') {
+            priorityFilteredRoutes = routesData.filter(
+                route => route.elevationChange >= minElevation && route.elevationChange <= maxElevation
+            );
+
+            if (priorityFilteredRoutes.length === 0) {
+                alert(`No routes match elevation range. Min: ${Math.min(...routesData.map(r => r.elevationChange))}, Max: ${Math.max(...routesData.map(r => r.elevationChange))}`);
+                return;
+            }
+
+            secondaryRank = priorityFilteredRoutes.map(route => ({
+                ...route,
+                secondaryScore: Math.abs(route.poiCount - minPOI),
+            })).sort((a, b) => a.secondaryScore - b.secondaryScore);
+
+        } else if (priorityFactor === 'poi') {
+            priorityFilteredRoutes = routesData.filter(route => route.poiCount >= minPOI);
+
+            if (priorityFilteredRoutes.length === 0) {
+                alert(`No routes match minimum POI. Min: ${Math.min(...routesData.map(r => r.poiCount))}, Max: ${Math.max(...routesData.map(r => r.poiCount))}`);
+                return;
+            }
+
+            secondaryRank = priorityFilteredRoutes.map(route => ({
+                ...route,
+                secondaryScore: Math.abs(route.elevationChange - ((minElevation + maxElevation) / 2)),
+            })).sort((a, b) => a.secondaryScore - b.secondaryScore);
+        }
+
+        const selectedRoute = secondaryRank[0];
+
+        if (currentRoute) {
+            map.removeLayer(currentRoute);
+        }
+        clearPOIMarkers();
+
+        currentRoute = L.polyline(selectedRoute.coordinates, { color: 'red' }).addTo(map);
+        map.fitBounds(currentRoute.getBounds());
+
+        countPOIsOnRoute(selectedRoute.coordinates);
+        document.getElementById('output').innerHTML = `Selected Route: Distance = ${(selectedRoute.distance / 1000).toFixed(2)} km, Elevation Change = ${selectedRoute.elevationChange} m, POIs = ${selectedRoute.poiCount}`;
+        drawElevationChart(selectedRoute.coordinates);
     }
-
-    const selectedRoute = filteredRoutes[0];
-
-    // 清除当前地图上的路径和 POI 标注
-    if (currentRoute) {
-        map.removeLayer(currentRoute);
-    }
-    clearPOIMarkers();
-
-    // 在地图上绘制选中路径
-    currentRoute = L.polyline(selectedRoute.coordinates, { color: 'red' }).addTo(map);
-    map.fitBounds(currentRoute.getBounds());
-
-    // 标注路径经过的 POI
-    countPOIsOnRoute(selectedRoute.coordinates);
-
-    // 更新前端显示信息
-    document.getElementById('output').innerHTML = `Selected Route: Distance = ${(selectedRoute.distance / 1000).toFixed(2)} km, Elevation Change = ${selectedRoute.elevationChange} m, POIs = ${selectedRoute.poiCount}`;
-    drawElevationChart(selectedRoute.coordinates);
-}
 
     function generatePrecisePoints(origin, totalDistance) {
         const points = [];
